@@ -64,6 +64,12 @@ Rules:
   `api_key` are additionally in the redaction set as defense in depth.
 - Connection pooling is keyed by a SHA-256 fingerprint of the key (bounded LRU), never by the
   account name, so users on a shared process never share a `requests.Session`.
+- The datacenter suffix of an injected key becomes part of the request host, so it is validated
+  against `^[a-z0-9]{1,16}$` (lowercased) before any URL is built. A suffix that fails is a
+  user-facing error with no request made. This closes the redirect path a malicious per-user
+  key would otherwise open on a shared process (for example `x-localhost#` or `x-evil.com/`).
+- Optional flags treat an empty string or null as "not set" and fall back like an absent key;
+  the required `apiKey` still fails on an empty value.
 
 ## 3. File-by-file changes
 
@@ -144,7 +150,7 @@ fallback, precedence, and local standalone usage.
 ## 7. Validation record
 
 - `uv run ruff check src/ tests/`: clean
-- `uv run pytest`: 237 passed on mcp 2.2.0; 237 passed on mcp 1.30.0 in a separate venv
+- `uv run pytest`: 249 passed on mcp 2.2.0; 249 passed on mcp 1.30.0 in a separate venv
 - Import and console-script startup with an empty environment (`env -i`): the process starts,
   answers `initialize`, and resolves an injected `apiKey` / `readOnly` on `tools/call`
 - Handbook audit script: no findings (it scans TypeScript only); the manual Python equivalent

@@ -143,6 +143,41 @@ class TestValidation:
         req.assert_not_called()
         assert "dryRun" in payload["error"]
 
+    @pytest.mark.parametrize("blank", ["", "   ", None])
+    def test_blank_optional_flag_counts_as_unset(self, blank, monkeypatch: pytest.MonkeyPatch, mock_mc_request) -> None:
+        # An unset optional field that the configuration surface submits as empty must fall back
+        # to the environment flag, never fail the call.
+        monkeypatch.setattr(server, "READ_ONLY", True)
+        calls = mock_mc_request({"should": "not-be-called"})
+        payload = _call("add_member", {"list_id": "abc", "email_address": "a@b.com", "apiKey": INJECTED_KEY, "readOnly": blank, "dryRun": blank})
+        assert "MAILCHIMP_READ_ONLY" in payload["error"]
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "unsafe",
+        ["x-localhost#", "x-evil.com/", "x-us1@evil.com", "x-us9?x=1", "x-us1.evil.com", "x-", "x-us 1"],
+    )
+    def test_unsafe_datacenter_suffix_is_rejected_before_any_request(self, unsafe) -> None:
+        with patch.object(requests.Session, "request") as req:
+            payload = _call("ping", {"apiKey": unsafe})
+        req.assert_not_called()
+        assert "<key>-<dc>" in payload["error"]
+        assert "apiKey" in payload["error"]
+        assert unsafe not in payload["error"]
+
+    def test_datacenter_suffix_is_lowercased_into_host(self) -> None:
+        with patch.object(requests.Session, "request", return_value=_ok_resp({"health_check": "ok"})) as req:
+            _call("ping", {"apiKey": "key-US21"})
+        assert req.call_args.args[1] == "https://us21.api.mailchimp.com/3.0/ping"
+
+    def test_environment_key_with_unsafe_suffix_fails_at_request_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "MAILCHIMP_API_KEY", "envkey-evil.com/")
+        monkeypatch.setattr(server, "MAILCHIMP_BASE_URL", server._base_url_for("envkey-evil.com/"))
+        with patch.object(requests.Session, "request") as req:
+            payload = _call("ping", {})
+        req.assert_not_called()
+        assert "MAILCHIMP_API_KEY" in payload["error"]
+
 
 class TestSafetyFlags:
     def test_injected_read_only_blocks_writes_with_platform_remediation(self, mock_mc_request) -> None:

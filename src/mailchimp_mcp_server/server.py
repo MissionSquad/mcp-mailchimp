@@ -28,13 +28,28 @@ except ImportError:  # older mcp SDK without tool annotations; risk metadata sti
     ToolAnnotations = None
 
 
-def _dc_for(api_key: str) -> str:
-    """Datacenter encoded in a Mailchimp key (the part after the final dash), defaulting to us1."""
-    return api_key.split("-")[-1] if "-" in api_key else "us1"
+# A datacenter suffix is interpolated into the request host, so it must never contain anything
+# that could alter that host (a '/', '#', '?', '@', or '.' would let a caller redirect the request
+# to an arbitrary server). Mailchimp datacenters are short alphanumeric labels such as us8 or us21.
+_DC_RE = re.compile(r"^[a-z0-9]{1,16}$")
 
 
-def _base_url_for(api_key: str) -> str:
-    return f"https://{_dc_for(api_key)}.api.mailchimp.com/3.0"
+def _dc_for(api_key: str) -> Optional[str]:
+    """Datacenter encoded in a Mailchimp key (the part after the final dash), defaulting to us1
+    when the key carries no dash. Returns None when the suffix is not a plain alphanumeric label,
+    so an unsafe value can never reach the request host."""
+    if "-" not in api_key:
+        return "us1"
+    dc = api_key.rsplit("-", 1)[-1].lower()
+    return dc if _DC_RE.match(dc) else None
+
+
+def _base_url_for(api_key: str) -> Optional[str]:
+    dc = _dc_for(api_key)
+    return f"https://{dc}.api.mailchimp.com/3.0" if dc else None
+
+
+_BAD_KEY_FORMAT = "The Mailchimp API key is not in the form <key>-<dc> (for example abc123-us8)."
 
 
 # --- Config ---
@@ -178,15 +193,19 @@ _FLAG_TRUE = frozenset({"1", "true", "yes"})
 _FLAG_FALSE = frozenset({"0", "false", "no"})
 
 
-def _read_hidden_string(hidden: dict, key: str) -> Optional[str]:
+def _read_hidden_string(hidden: dict, key: str, *, optional: bool = False) -> Optional[str]:
     """Trimmed hidden string for `key`, or None when it was not injected.
 
     A present-but-invalid value (wrong type, empty, whitespace) raises HiddenConfigError with
-    remediation text instead of silently falling back to the environment.
+    remediation text instead of silently falling back to the environment. For an `optional`
+    value an empty string or null counts as "not set" and falls back like an absent key, so a
+    configuration surface that submits blanks for unset optional fields cannot break every call.
     """
     if key not in hidden:
         return None
     value = hidden[key]
+    if optional and (value is None or (isinstance(value, str) and not value.strip())):
+        return None
     if not isinstance(value, str):
         raise HiddenConfigError(
             f"The '{key}' value supplied for this server must be a string. "
@@ -203,7 +222,7 @@ def _read_hidden_string(hidden: dict, key: str) -> Optional[str]:
 
 def _read_hidden_flag(hidden: dict, key: str) -> Optional[bool]:
     """Hidden boolean flag for `key` ('true'/'false', '1'/'0', 'yes'/'no'), or None when absent."""
-    value = _read_hidden_string(hidden, key)
+    value = _read_hidden_string(hidden, key, optional=True)
     if value is None:
         return None
     lowered = value.lower()
@@ -224,8 +243,11 @@ def _resolve_hidden() -> dict:
     This is the only place hidden values are read.
     """
     hidden = _HIDDEN_ARGS.get() or {}
+    api_key = _read_hidden_string(hidden, "apiKey")
+    if api_key is not None and _dc_for(api_key) is None:
+        raise HiddenConfigError(f"{_BAD_KEY_FORMAT} Re-save the 'apiKey' secret for this server on MissionSquad.")
     return {
-        "api_key": _read_hidden_string(hidden, "apiKey"),
+        "api_key": api_key,
         "read_only": _read_hidden_flag(hidden, "readOnly"),
         "dry_run": _read_hidden_flag(hidden, "dryRun"),
     }
@@ -460,6 +482,9 @@ def mc_request(endpoint: str, params: Optional[dict] = None, body: Optional[dict
                 "Get your API key at https://mailchimp.com/help/about-api-keys/"
             )
         }
+    if not resolved["base_url"]:
+        # An environment key with an unsafe datacenter suffix; injected keys are rejected earlier.
+        return {"error": f"{_BAD_KEY_FORMAT} Check the MAILCHIMP_API_KEY value."}
     # Argument-contract validation: an empty interpolated path id yields a '//' segment, and
     # count must respect the Mailchimp cap. Reject before dispatching so the gateway and the
     # model get a clear, consistent error rather than an opaque 4xx.
@@ -484,6 +509,8 @@ def mc_request(endpoint: str, params: Optional[dict] = None, body: Optional[dict
             return {"error": "Request timed out after 30 seconds", "endpoint": endpoint}
         except requests.exceptions.ConnectionError:
             return {"error": "Could not connect to Mailchimp API", "endpoint": endpoint}
+        except requests.exceptions.RequestException as exc:
+            return {"error": f"Request failed: {type(exc).__name__}", "endpoint": endpoint}
         if resp.status_code in _RETRY_STATUSES and attempt < MAX_RETRIES:
             time.sleep(_retry_delay(resp, attempt))
             continue

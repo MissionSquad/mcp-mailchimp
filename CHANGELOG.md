@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   README section "MissionSquad (hidden secret injection)" and `docs/missionsquad-hidden-secrets.md`.
 - `list_accounts` now reports `credentials` (`injected` or `environment`) and, for an injected
   user, the single `default` target only.
+- The datacenter suffix of an API key (`<key>-<dc>`) is now validated as a plain alphanumeric
+  label before it is interpolated into the request host. A key whose suffix contains `/`, `#`,
+  `?`, `@`, `.` or similar is rejected with a user-facing error and no request is made, so a
+  per-user key can never redirect the shared process to another host. Blank optional
+  `readOnly` / `dryRun` values count as unset and fall back to the environment flag.
 
 ### Changed
 - Pooled HTTP sessions are keyed by a SHA-256 fingerprint of the API key (bounded LRU) instead
