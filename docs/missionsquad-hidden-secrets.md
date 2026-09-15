@@ -70,6 +70,8 @@ Rules:
   key would otherwise open on a shared process (for example `x-localhost#` or `x-evil.com/`).
 - Optional flags treat an empty string or null as "not set" and fall back like an absent key;
   the required `apiKey` still fails on an empty value.
+- An injected key must carry an explicit `<key>-<dc>` form (non-empty prefix, dash, valid
+  suffix). The no-dash -> `us1` fallback remains for legacy environment configuration only.
 
 ## 3. File-by-file changes
 
@@ -150,7 +152,7 @@ fallback, precedence, and local standalone usage.
 ## 7. Validation record
 
 - `uv run ruff check src/ tests/`: clean
-- `uv run pytest`: 249 passed on mcp 2.2.0; 249 passed on mcp 1.30.0 in a separate venv
+- `uv run pytest`: 254 passed on mcp 2.2.0; 254 passed on mcp 1.30.0 in a separate venv
 - Import and console-script startup with an empty environment (`env -i`): the process starts,
   answers `initialize`, and resolves an injected `apiKey` / `readOnly` on `tools/call`
 - Handbook audit script: no findings (it scans TypeScript only); the manual Python equivalent

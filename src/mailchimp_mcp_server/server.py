@@ -41,7 +41,8 @@ def _dc_for(api_key: str) -> Optional[str]:
     if "-" not in api_key:
         return "us1"
     dc = api_key.rsplit("-", 1)[-1].lower()
-    return dc if _DC_RE.match(dc) else None
+    # fullmatch, not match: `$` would accept a trailing newline, which must never reach the host.
+    return dc if _DC_RE.fullmatch(dc) else None
 
 
 def _base_url_for(api_key: str) -> Optional[str]:
@@ -244,7 +245,10 @@ def _resolve_hidden() -> dict:
     """
     hidden = _HIDDEN_ARGS.get() or {}
     api_key = _read_hidden_string(hidden, "apiKey")
-    if api_key is not None and _dc_for(api_key) is None:
+    # An injected key must carry an explicit datacenter: the no-dash -> us1 fallback exists only
+    # for legacy environment configuration, and a platform user should get the format error, not
+    # a 401 from the wrong datacenter.
+    if api_key is not None and ("-" not in api_key or not api_key.rsplit("-", 1)[0] or _dc_for(api_key) is None):
         raise HiddenConfigError(f"{_BAD_KEY_FORMAT} Re-save the 'apiKey' secret for this server on MissionSquad.")
     return {
         "api_key": api_key,
@@ -484,7 +488,8 @@ def mc_request(endpoint: str, params: Optional[dict] = None, body: Optional[dict
         }
     if not resolved["base_url"]:
         # An environment key with an unsafe datacenter suffix; injected keys are rejected earlier.
-        return {"error": f"{_BAD_KEY_FORMAT} Check the MAILCHIMP_API_KEY value."}
+        env_name = "MAILCHIMP_API_KEY" if resolved["name"] == DEFAULT_ACCOUNT else f"MAILCHIMP_API_KEY_{resolved['name'].upper()}"
+        return {"error": f"{_BAD_KEY_FORMAT} Check the {env_name} value."}
     # Argument-contract validation: an empty interpolated path id yields a '//' segment, and
     # count must respect the Mailchimp cap. Reject before dispatching so the gateway and the
     # model get a clear, consistent error rather than an opaque 4xx.

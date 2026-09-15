@@ -165,6 +165,38 @@ class TestValidation:
         assert "apiKey" in payload["error"]
         assert unsafe not in payload["error"]
 
+    def test_trailing_newline_in_suffix_is_rejected(self) -> None:
+        # re.match with `$` would accept "us1\n"; the host must never receive a control character.
+        assert server._dc_for("key-us1\n") is None
+        assert server._dc_for("key-us1\nevil") is None
+        assert server._base_url_for("key-us1\n") is None
+
+    @pytest.mark.parametrize("dashless", ["nodashkey", "-us1"])
+    def test_injected_key_must_carry_a_datacenter(self, dashless) -> None:
+        with patch.object(requests.Session, "request") as req:
+            payload = _call("ping", {"apiKey": dashless})
+        req.assert_not_called()
+        assert "<key>-<dc>" in payload["error"]
+
+    def test_environment_key_without_dash_keeps_us1_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "MAILCHIMP_API_KEY", "nodashkey")
+        monkeypatch.setattr(server, "MAILCHIMP_BASE_URL", server._base_url_for("nodashkey"))
+        with patch.object(requests.Session, "request", return_value=_ok_resp({"health_check": "ok"})) as req:
+            _call("ping", {})
+        assert req.call_args.args[1] == "https://us1.api.mailchimp.com/3.0/ping"
+
+    def test_named_environment_account_error_names_its_own_variable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        bad = "envkey-evil.com/"
+        monkeypatch.setattr(
+            server,
+            "MAILCHIMP_ACCOUNTS",
+            {"marketing": {"api_key": bad, "dc": server._dc_for(bad), "base_url": server._base_url_for(bad), "read_only": False, "dry_run": False}},
+        )
+        with patch.object(requests.Session, "request") as req:
+            payload = _call("ping", {"account": "marketing"})
+        req.assert_not_called()
+        assert "MAILCHIMP_API_KEY_MARKETING" in payload["error"]
+
     def test_datacenter_suffix_is_lowercased_into_host(self) -> None:
         with patch.object(requests.Session, "request", return_value=_ok_resp({"health_check": "ok"})) as req:
             _call("ping", {"apiKey": "key-US21"})
