@@ -7,7 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MissionSquad hidden secret injection.** The server now reads the Mailchimp API key and the
+  optional `readOnly` / `dryRun` safety flags from hidden per-call arguments injected by the
+  MissionSquad `mcp-api`, so one shared process can serve many users with different
+  credentials. No tool schema declares those keys; `HiddenArgsServer.call_tool` strips every
+  undeclared argument before the SDK validates the call and exposes it to a single resolver
+  (`_resolve_account`) through a per-call context variable, the equivalent of FastMCP's
+  `context.extraArgs`. Hidden values take precedence over the environment on every call;
+  environment variables remain the local standalone path and behave exactly as before.
+  Registration metadata (`secretNames` / `secretFields`) ships in `missionsquad.json`; see the
+  README section "MissionSquad (hidden secret injection)" and `docs/missionsquad-hidden-secrets.md`.
+- `list_accounts` now reports `credentials` (`injected` or `environment`) and, for an injected
+  user, the single `default` target only.
+
+### Changed
+- Pooled HTTP sessions are keyed by a SHA-256 fingerprint of the API key (bounded LRU) instead
+  of the account name, so users sharing one process never share a connection or cookie jar.
+- The missing-key error names both remediations (the MissionSquad `apiKey` secret and
+  `MAILCHIMP_API_KEY`); the read-only error names the `readOnly` secret when that flag was
+  injected rather than set in the environment.
+
 ### Fixed
+- `ping` and `get_account_info` swallowed the error object from a failed or unauthenticated
+  request and returned nulls; both now return the error object their docstrings promised.
 - **Server failed to start against `mcp` 2.x.** `mcp` 2.0 restructured the package: the
   high-level server class moved from `mcp.server.fastmcp.FastMCP` to
   `mcp.server.mcpserver.MCPServer`, so `server.py`'s `from mcp.server.fastmcp import FastMCP`

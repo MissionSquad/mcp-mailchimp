@@ -1,9 +1,12 @@
+import contextvars
 import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -24,13 +27,27 @@ try:
 except ImportError:  # older mcp SDK without tool annotations; risk metadata still ships via describe_tools
     ToolAnnotations = None
 
+
+def _dc_for(api_key: str) -> str:
+    """Datacenter encoded in a Mailchimp key (the part after the final dash), defaulting to us1."""
+    return api_key.split("-")[-1] if "-" in api_key else "us1"
+
+
+def _base_url_for(api_key: str) -> str:
+    return f"https://{_dc_for(api_key)}.api.mailchimp.com/3.0"
+
+
 # --- Config ---
+# Environment variables are the *local standalone* configuration path. On MissionSquad the
+# per-user values are injected into every tool call instead (see "MissionSquad hidden secret
+# injection" below) and always take precedence over these process-wide fallbacks.
+#
 # The plain MAILCHIMP_API_KEY is the implicit "default" account. It is served from
 # these module globals (not the registry below) so a single-key setup behaves
 # exactly as before and existing call sites/tests are unaffected.
 MAILCHIMP_API_KEY = os.environ.get("MAILCHIMP_API_KEY", "")
-MAILCHIMP_DC = MAILCHIMP_API_KEY.split("-")[-1] if "-" in MAILCHIMP_API_KEY else "us1"
-MAILCHIMP_BASE_URL = f"https://{MAILCHIMP_DC}.api.mailchimp.com/3.0"
+MAILCHIMP_DC = _dc_for(MAILCHIMP_API_KEY)
+MAILCHIMP_BASE_URL = _base_url_for(MAILCHIMP_API_KEY)
 READ_ONLY = os.environ.get("MAILCHIMP_READ_ONLY", "").lower() in ("1", "true", "yes")
 DRY_RUN = os.environ.get("MAILCHIMP_DRY_RUN", "").lower() in ("1", "true", "yes")
 # When MAILCHIMP_AUDIT_LOG is truthy, every tool dispatch emits a structured JSON audit
@@ -73,7 +90,9 @@ TOOL_RISK: dict = {}
 # Params whose values are bulky or sensitive (PII) and must not appear verbatim in audit
 # events: subscriber emails and merge fields (name, address, phone) fall under GDPR, and
 # file_data is bulky base64. Redacted to '<redacted>' by _emit_audit before the event is written.
-_AUDIT_REDACT = frozenset({"file_data", "email_address", "email", "merge_fields"})
+# apiKey / api_key can never reach the audit path (hidden values are stripped before any tool
+# runs) but are listed anyway as defense in depth.
+_AUDIT_REDACT = frozenset({"file_data", "email_address", "email", "merge_fields", "apiKey", "api_key"})
 
 
 def _truthy(value: str) -> bool:
@@ -101,11 +120,10 @@ def _load_accounts() -> dict:
         name = env_name[len(prefix):].lower()
         if not name or name == DEFAULT_ACCOUNT:
             continue
-        dc = api_key.split("-")[-1] if "-" in api_key else "us1"
         accounts[name] = {
             "api_key": api_key,
-            "dc": dc,
-            "base_url": f"https://{dc}.api.mailchimp.com/3.0",
+            "dc": _dc_for(api_key),
+            "base_url": _base_url_for(api_key),
             "read_only": _truthy(os.environ.get(f"MAILCHIMP_READ_ONLY_{name.upper()}", "")),
             "dry_run": _truthy(os.environ.get(f"MAILCHIMP_DRY_RUN_{name.upper()}", "")),
         }
@@ -114,7 +132,103 @@ def _load_accounts() -> dict:
 
 MAILCHIMP_ACCOUNTS = _load_accounts()
 
-mcp = MCPServer("mailchimp-mcp-server")
+
+# --- MissionSquad hidden secret injection ---
+# MissionSquad's mcp-api merges the user's saved server secrets (declared as `secretNames` in the
+# server registration, see missionsquad.json) into the tools/call arguments right before the
+# call. Those keys are deliberately absent from every tool schema, so the model never sees them.
+# The mcp SDK validates arguments with a pydantic model that silently drops undeclared keys, so
+# they are captured here -- before validation -- and exposed to the resolver through a per-call
+# context variable, the equivalent of FastMCP's `context.extraArgs`.
+HIDDEN_ARG_NAMES = ("apiKey", "readOnly", "dryRun")
+
+_HIDDEN_ARGS: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar("mailchimp_hidden_args", default=None)
+
+
+class HiddenConfigError(ValueError):
+    """A hidden (platform-injected) value failed validation. The message is user-facing."""
+
+
+class HiddenArgsServer(MCPServer):
+    """MCPServer that separates undeclared tool-call arguments from declared ones.
+
+    Declared arguments (those in the tool's JSON schema) are forwarded to the SDK as usual.
+    Every other key is removed from the arguments -- so no tool body can ever receive or forward
+    it -- and made available to _resolve_account for the duration of the call only. The
+    override works on both mcp 1.x (call_tool(name, arguments)) and 2.x
+    (call_tool(name, arguments, context)); extra positional/keyword parameters pass through.
+    """
+
+    async def call_tool(self, name: str, arguments: dict, *args, **kwargs):
+        tool = self._tool_manager.get_tool(name)
+        declared = set((tool.parameters or {}).get("properties", {})) if tool is not None else set()
+        raw = arguments or {}
+        visible = {key: value for key, value in raw.items() if key in declared}
+        hidden = {key: value for key, value in raw.items() if key not in declared}
+        token = _HIDDEN_ARGS.set(hidden or None)
+        try:
+            return await super().call_tool(name, visible, *args, **kwargs)
+        finally:
+            _HIDDEN_ARGS.reset(token)
+
+
+mcp = HiddenArgsServer("mailchimp-mcp-server")
+
+_FLAG_TRUE = frozenset({"1", "true", "yes"})
+_FLAG_FALSE = frozenset({"0", "false", "no"})
+
+
+def _read_hidden_string(hidden: dict, key: str) -> Optional[str]:
+    """Trimmed hidden string for `key`, or None when it was not injected.
+
+    A present-but-invalid value (wrong type, empty, whitespace) raises HiddenConfigError with
+    remediation text instead of silently falling back to the environment.
+    """
+    if key not in hidden:
+        return None
+    value = hidden[key]
+    if not isinstance(value, str):
+        raise HiddenConfigError(
+            f"The '{key}' value supplied for this server must be a string. "
+            f"Re-save the '{key}' secret for this server on MissionSquad."
+        )
+    value = value.strip()
+    if not value:
+        raise HiddenConfigError(
+            f"The '{key}' value supplied for this server is empty. "
+            f"Re-save the '{key}' secret for this server on MissionSquad with a real value."
+        )
+    return value
+
+
+def _read_hidden_flag(hidden: dict, key: str) -> Optional[bool]:
+    """Hidden boolean flag for `key` ('true'/'false', '1'/'0', 'yes'/'no'), or None when absent."""
+    value = _read_hidden_string(hidden, key)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in _FLAG_TRUE:
+        return True
+    if lowered in _FLAG_FALSE:
+        return False
+    raise HiddenConfigError(
+        f"The '{key}' value supplied for this server must be 'true' or 'false'. "
+        f"Re-save the '{key}' secret for this server on MissionSquad."
+    )
+
+
+def _resolve_hidden() -> dict:
+    """Read and validate the hidden values injected into the current tool call.
+
+    Returns {api_key, read_only, dry_run}; each is None when that value was not injected.
+    This is the only place hidden values are read.
+    """
+    hidden = _HIDDEN_ARGS.get() or {}
+    return {
+        "api_key": _read_hidden_string(hidden, "apiKey"),
+        "read_only": _read_hidden_flag(hidden, "readOnly"),
+        "dry_run": _read_hidden_flag(hidden, "dryRun"),
+    }
 
 
 # --- Helpers ---
@@ -128,36 +242,75 @@ def _available_account_names() -> list:
 
 
 def _resolve_account(account: Optional[str]) -> dict:
-    """Resolve an account selector to its credentials and safety flags.
+    """Resolve the execution target of the current call: credentials plus safety flags.
 
-    account=None (or "default") uses the live module globals -- the implicit default
-    account -- so single-key setups and the existing test monkeypatches behave exactly
-    as before. A named account is looked up in MAILCHIMP_ACCOUNTS. Unknown names return
-    an {"error": ...} dict listing the available accounts. account=None never auto-routes
-    to a named account, even if only one is configured. Selectors are matched
-    case-insensitively, since account names are lowercased when the registry is built.
+    Precedence, per field: the hidden value injected into this tool call (MissionSquad), then
+    the environment fallback, then an error. An injected apiKey defines the one target for the
+    call, so `account` must then be omitted or "default"; the MAILCHIMP_API_KEY_<NAME> registry
+    is a local standalone feature and is never consulted for an injected user.
+
+    Without an injected key, account=None (or "default") uses the live module globals -- the
+    implicit default account -- so single-key setups and the existing test monkeypatches behave
+    exactly as before. A named account is looked up in MAILCHIMP_ACCOUNTS. Unknown names return
+    an {"error": ...} dict listing the available accounts. account=None never auto-routes to a
+    named account, even if only one is configured. Selectors are matched case-insensitively,
+    since account names are lowercased when the registry is built.
+
+    The result also carries `credentials` ('injected' | 'environment') and `read_only_source`
+    so callers can phrase remediation for the right configuration path.
     """
+    try:
+        injected = _resolve_hidden()
+    except HiddenConfigError as exc:
+        return {"error": str(exc)}
     if account is not None:
         account = account.lower()
-    if account is None or account == DEFAULT_ACCOUNT:
-        return {
+    if injected["api_key"] is not None:
+        if account not in (None, DEFAULT_ACCOUNT):
+            return {
+                "error": (
+                    "Account selection is not available: this server's credentials are supplied by the "
+                    "platform, one Mailchimp account per user. Omit the `account` argument."
+                )
+            }
+        api_key = injected["api_key"]
+        resolved = {
+            "name": DEFAULT_ACCOUNT,
+            "api_key": api_key,
+            "base_url": _base_url_for(api_key),
+            "read_only": READ_ONLY,
+            "dry_run": DRY_RUN,
+            "credentials": "injected",
+        }
+    elif account is None or account == DEFAULT_ACCOUNT:
+        resolved = {
             "name": DEFAULT_ACCOUNT,
             "api_key": MAILCHIMP_API_KEY,
             "base_url": MAILCHIMP_BASE_URL,
             "read_only": READ_ONLY,
             "dry_run": DRY_RUN,
+            "credentials": "environment",
         }
-    cfg = MAILCHIMP_ACCOUNTS.get(account)
-    if cfg is None:
-        available = ", ".join(_available_account_names()) or "(none configured)"
-        return {"error": f"Unknown account '{account}'. Available accounts: {available}."}
-    return {
-        "name": account,
-        "api_key": cfg["api_key"],
-        "base_url": cfg["base_url"],
-        "read_only": cfg["read_only"],
-        "dry_run": cfg["dry_run"],
-    }
+    else:
+        cfg = MAILCHIMP_ACCOUNTS.get(account)
+        if cfg is None:
+            available = ", ".join(_available_account_names()) or "(none configured)"
+            return {"error": f"Unknown account '{account}'. Available accounts: {available}."}
+        resolved = {
+            "name": account,
+            "api_key": cfg["api_key"],
+            "base_url": cfg["base_url"],
+            "read_only": cfg["read_only"],
+            "dry_run": cfg["dry_run"],
+            "credentials": "environment",
+        }
+    resolved["read_only_source"] = "environment"
+    if injected["read_only"] is not None:
+        resolved["read_only"] = injected["read_only"]
+        resolved["read_only_source"] = "injected"
+    if injected["dry_run"] is not None:
+        resolved["dry_run"] = injected["dry_run"]
+    return resolved
 
 
 def _caller_tool() -> Optional[str]:
@@ -224,7 +377,11 @@ def _guard_write(*, account: Optional[str] = None, **context) -> Optional[str]:
         return json.dumps({"error": resolved["error"]}, indent=2)
     if resolved["read_only"]:
         _emit_audit(caller, "blocked_read_only", account=resolved["name"], args=dict(context))
-        return json.dumps({"error": "Server is in read-only mode. Set MAILCHIMP_READ_ONLY=false to allow writes."}, indent=2)
+        if resolved["read_only_source"] == "injected":
+            message = "Server is in read-only mode for your account. Set the 'readOnly' secret for this server to false on MissionSquad to allow writes."
+        else:
+            message = "Server is in read-only mode. Set MAILCHIMP_READ_ONLY=false to allow writes."
+        return json.dumps({"error": message}, indent=2)
     if resolved["dry_run"]:
         risk = TOOL_RISK.get(caller)
         _emit_audit(caller, "dry_run", account=resolved["name"], args=dict(context))
@@ -232,9 +389,14 @@ def _guard_write(*, account: Optional[str] = None, **context) -> Optional[str]:
     return None
 
 
-# One pooled requests.Session per account (keyed by account name) so sequential tool calls
-# reuse the TCP/TLS connection instead of paying a fresh handshake each time. Populated lazily.
-_SESSIONS: dict = {}
+# One pooled requests.Session per API key so sequential tool calls reuse the TCP/TLS connection
+# instead of paying a fresh handshake each time. Keyed by a SHA-256 fingerprint of the key (never
+# the key itself, and never the account name: on a shared multi-user process every injected user
+# resolves to "default", and users must not share a session or its cookie jar). Bounded LRU so a
+# long-lived multi-user process cannot grow it without limit. Populated lazily.
+_SESSIONS: "OrderedDict[str, requests.Session]" = OrderedDict()
+_SESSIONS_LOCK = threading.Lock()
+_MAX_SESSIONS = 64
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -258,11 +420,17 @@ def _cap(text: str) -> tuple[str, bool, int]:
     return text[:MAX_CONTENT_CHARS], True, length
 
 
-def _session_for(name: str) -> requests.Session:
-    session = _SESSIONS.get(name)
-    if session is None:
-        session = requests.Session()
-        _SESSIONS[name] = session
+def _session_for(api_key: str) -> requests.Session:
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest()
+    with _SESSIONS_LOCK:
+        session = _SESSIONS.get(fingerprint)
+        if session is None:
+            session = requests.Session()
+            _SESSIONS[fingerprint] = session
+            while len(_SESSIONS) > _MAX_SESSIONS:
+                _SESSIONS.popitem(last=False)
+        else:
+            _SESSIONS.move_to_end(fingerprint)
     return session
 
 
@@ -285,7 +453,13 @@ def mc_request(endpoint: str, params: Optional[dict] = None, body: Optional[dict
         return {"error": resolved["error"]}
     api_key = resolved["api_key"]
     if not api_key:
-        return {"error": "MAILCHIMP_API_KEY environment variable is not set. Get your API key at https://mailchimp.com/help/about-api-keys/"}
+        return {
+            "error": (
+                "No Mailchimp API key is configured. On MissionSquad, save the 'apiKey' secret for this server; "
+                "for local use, set the MAILCHIMP_API_KEY environment variable. "
+                "Get your API key at https://mailchimp.com/help/about-api-keys/"
+            )
+        }
     # Argument-contract validation: an empty interpolated path id yields a '//' segment, and
     # count must respect the Mailchimp cap. Reject before dispatching so the gateway and the
     # model get a clear, consistent error rather than an opaque 4xx.
@@ -302,7 +476,7 @@ def mc_request(endpoint: str, params: Optional[dict] = None, body: Optional[dict
         _emit_audit(_caller_tool(), "executed", account=resolved["name"], method=method, endpoint=endpoint, args=params or body)
     url = f"{resolved['base_url']}/{endpoint.lstrip('/')}"
     auth = ("anystring", api_key)
-    session = _session_for(resolved["name"])
+    session = _session_for(api_key)
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = session.request(method, url, auth=auth, params=params, json=body, timeout=30)
@@ -336,24 +510,30 @@ def list_accounts() -> str:
     """List the Mailchimp accounts this server is configured to use.
 
     Use this to discover the account names accepted by the `account` argument on every
-    other tool. Multi-account support is opt-in: define extra accounts with
-    MAILCHIMP_API_KEY_<NAME> environment variables; the plain MAILCHIMP_API_KEY is the
-    implicit 'default'. Selection is per call and stateless -- no tool changes an active
-    account. Use get_account_info for live stats about a specific account.
+    other tool. When the platform supplies your credentials there is exactly one account,
+    'default', and `account` must be omitted. Otherwise multi-account support is opt-in:
+    define extra accounts with MAILCHIMP_API_KEY_<NAME> environment variables; the plain
+    MAILCHIMP_API_KEY is the implicit 'default'. Selection is per call and stateless -- no
+    tool changes an active account. Use get_account_info for live stats about a specific account.
 
     No network call. Never returns API keys or any secret material.
 
     Returns:
-        JSON with `accounts`: an array of {name, read_only, dry_run, is_default}. The
-        'default' entry appears only when MAILCHIMP_API_KEY is set.
+        JSON with `credentials` ('injected' when supplied by the platform, else 'environment')
+        and `accounts`: an array of {name, read_only, dry_run, is_default}. The 'default'
+        entry appears only when a key is available for it.
     """
+    default = _resolve_account(None)
+    if "error" in default:
+        return json.dumps({"error": default["error"]}, indent=2)
     accounts = []
-    if MAILCHIMP_API_KEY:
-        accounts.append({"name": DEFAULT_ACCOUNT, "read_only": READ_ONLY, "dry_run": DRY_RUN, "is_default": True})
-    for name in sorted(MAILCHIMP_ACCOUNTS):
-        cfg = MAILCHIMP_ACCOUNTS[name]
-        accounts.append({"name": name, "read_only": cfg["read_only"], "dry_run": cfg["dry_run"], "is_default": False})
-    return json.dumps({"accounts": accounts}, indent=2)
+    if default["api_key"]:
+        accounts.append({"name": DEFAULT_ACCOUNT, "read_only": default["read_only"], "dry_run": default["dry_run"], "is_default": True})
+    if default["credentials"] == "environment":
+        for name in sorted(MAILCHIMP_ACCOUNTS):
+            cfg = MAILCHIMP_ACCOUNTS[name]
+            accounts.append({"name": name, "read_only": cfg["read_only"], "dry_run": cfg["dry_run"], "is_default": False})
+    return json.dumps({"credentials": default["credentials"], "accounts": accounts}, indent=2)
 
 
 @mcp.tool()
@@ -379,6 +559,8 @@ def get_account_info(account: str | None = None) -> str:
         get_account_info() -> {"account_name": "My Company", "total_subscribers": 5000, "industry_stats": {"open_rate": 0.21, ...}}
     """
     data = mc_request("/", account=account)
+    if "error" in data:
+        return json.dumps(data, indent=2)
     return json.dumps({
         "account_name": data.get("account_name"),
         "email": data.get("email"),
@@ -4635,6 +4817,8 @@ def ping(account: str | None = None) -> str:
         JSON with health_check ('ok' if connected), status_code (200 if healthy).
     """
     data = mc_request("/ping", account=account)
+    if "error" in data:
+        return json.dumps(data, indent=2)
     return json.dumps({
         "health_check": data.get("health_check"),
         "status_code": 200 if "health_check" in data else data.get("status", 0),

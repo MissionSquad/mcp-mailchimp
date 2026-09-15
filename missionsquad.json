@@ -1,0 +1,34 @@
+{
+  "name": "mcp-mailchimp",
+  "transportType": "stdio",
+  "command": "mailchimp-mcp-server",
+  "args": [],
+  "env": {
+    "MAILCHIMP_TOOLS": "all"
+  },
+  "secretNames": ["apiKey", "readOnly", "dryRun"],
+  "secretFields": [
+    {
+      "name": "apiKey",
+      "label": "Mailchimp API key",
+      "description": "Your Mailchimp API key in the form <key>-<dc>, for example abc123-us8. The datacenter is derived from the suffix. Create one at https://mailchimp.com/help/about-api-keys/.",
+      "required": true,
+      "inputType": "password"
+    },
+    {
+      "name": "readOnly",
+      "label": "Read-only mode",
+      "description": "Optional. 'true' blocks every write tool for your account; reads still work. Leave empty to allow writes.",
+      "required": false,
+      "inputType": "password"
+    },
+    {
+      "name": "dryRun",
+      "label": "Dry-run mode",
+      "description": "Optional. 'true' makes write tools return a preview of what they would do instead of calling Mailchimp. Leave empty to execute writes.",
+      "required": false,
+      "inputType": "password"
+    }
+  ],
+  "enabled": true
+}
