@@ -291,12 +291,16 @@ class TestRetry:
 
 
 class TestSessionPooling:
-    def test_session_reused_per_account(self) -> None:
+    def test_session_reused_per_key(self) -> None:
+        # The pool is keyed by a fingerprint of the API key, never the account name or the key.
         server._SESSIONS.clear()
         with patch.object(requests.Session, "request", return_value=_resp(200, payload={"ok": True})):
             server.mc_request("/ping")
             server.mc_request("/lists")
-        assert set(server._SESSIONS) == {"default"}
+        assert len(server._SESSIONS) == 1
+        (fingerprint,) = server._SESSIONS
+        assert fingerprint not in ("default", "test-key-us1")
+        assert "test-key" not in fingerprint
 
 
 class TestAuditPiiRedaction:

@@ -151,9 +151,11 @@ pip install -e .
 
 ## Configuration
 
+Environment variables configure the server for local standalone use. On MissionSquad the API key and safety flags are supplied per user instead; see [MissionSquad (hidden secret injection)](#missionsquad-hidden-secret-injection).
+
 | Variable | Required | Description |
 |---|---|---|
-| `MAILCHIMP_API_KEY` | Yes | Your Mailchimp API key (format: `<key>-<dc>`, e.g. `abc123-us8`) |
+| `MAILCHIMP_API_KEY` | Yes (local) | Your Mailchimp API key (format: `<key>-<dc>`, e.g. `abc123-us8`) |
 | `MAILCHIMP_READ_ONLY` | No | Set to `true` to disable all write operations (default: `false`) |
 | `MAILCHIMP_DRY_RUN` | No | Set to `true` to preview write operations without executing them (default: `false`) |
 | `MAILCHIMP_API_KEY_<NAME>` | No | API key for an additional named account (e.g. `MAILCHIMP_API_KEY_MARKETING`). Target it with the `account` argument. See [Multi-account](#multi-account). |
@@ -222,6 +224,26 @@ Single-key setups are unaffected: with only `MAILCHIMP_API_KEY` set, nothing cha
   }
 }
 ```
+
+### MissionSquad (hidden secret injection)
+
+On [MissionSquad](https://missionsquad.ai) one shared server process serves many users, so credentials are **not** read from environment variables. Each user saves their values once through the MissionSquad server configuration UI (`POST /mcp/user/servers/:name/secrets`); the platform stores them encrypted and injects them into every `tools/call` as hidden arguments. The server strips those keys before any tool runs, so they never appear in a tool schema, in the model's transcript, in a dry-run preview, in a request body, or in the audit log.
+
+| Hidden name | Required | Description |
+|---|---|---|
+| `apiKey` | Yes | Mailchimp API key, `<key>-<dc>`. The datacenter is derived from the suffix. |
+| `readOnly` | No | `true` blocks every write tool for this user. |
+| `dryRun` | No | `true` makes write tools return a preview instead of calling Mailchimp. |
+
+The registration payload with the matching `secretNames` and `secretFields` is in [`missionsquad.json`](missionsquad.json).
+
+**Precedence, per value and per call:** the hidden value injected into the call, then the environment variable (`MAILCHIMP_API_KEY`, `MAILCHIMP_READ_ONLY`, `MAILCHIMP_DRY_RUN`), then a user-facing error for the key (the flags default to `false`). Hidden values always win, so a process-wide `MAILCHIMP_READ_ONLY=true` acts as an operator default that a user's own `readOnly=false` can override.
+
+**One account per user.** An injected `apiKey` is the single execution target for that call. The `account` argument must be omitted (or `"default"`); any other name returns an error. The `MAILCHIMP_API_KEY_<NAME>` multi-account registry is a local standalone feature and is never consulted for an injected user. `list_accounts` reports `"credentials": "injected"` and the one `default` entry, never key material.
+
+**Local standalone use is unchanged.** Without injected values the server behaves exactly as documented above, reading everything from the environment. The process starts without any key present in both modes; a call made before a key is available returns an error naming both remediations.
+
+**Isolation.** Pooled HTTP sessions are keyed by a fingerprint of the API key, never by account name, so users sharing one process never share a connection or its cookie jar.
 
 ### MCP client configuration
 
